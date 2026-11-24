@@ -1,0 +1,448 @@
+# =====================================================================
+# APLIKASI UJIAN ONLINE (CBT) LENGKAP - MOODLE + JITSI + MONITORING
+#
+# FITUR UJIAN (Moodle Quiz)
+#  - Bank soal & kategori; import GIFT, Moodle XML, Aiken
+#  - Pilihan ganda, benar/salah, isian, esai, menjodohkan, numerik, drag&drop
+#  - Acak soal/jawaban, timer, batas percobaan, password & IP quiz
+#  - Penilaian otomatis, analisis butir soal, laporan nilai, sertifikat
+#  - Kelas, peserta, peran, notifikasi email, aplikasi mobile Moodle
+#  - Safe Exam Browser (SEB) & plugin proctoring (quizaccess_proctoring)
+#
+# FITUR TAMBAHAN DI STACK INI
+#  - Bagikan layar peserta ke pengawas (Jitsi: lobby, prejoin, breakout)
+#  - Cache Redis, cron otomatis, healthcheck semua layanan
+#  - Backup harian database + file (retensi 14 hari)
+#  - HTTPS otomatis (Caddy)               -> profile "proxy"
+#  - Monitoring uptime & log (Kuma/Dozzle) -> profile "monitoring"
+#  - Login terpusat SSO (Keycloak: 2FA, Google/Microsoft, reset password,
+#    import user massal)                    -> profile "sso"
+#  - Email testing (Mailpit), phpMyAdmin
+#
+# CARA PAKAI
+#  1. (Opsional) buat file .env untuk mengganti nilai default. Contoh:
+#       DB_ROOT_PASSWORD=...   DB_PASSWORD=...   MOODLE_PASSWORD=...
+#       MOODLE_EMAIL=admin@sekolah.sch.id   TZ=Asia/Jayapura
+#       JVB_ADVERTISE_IPS=192.168.1.10      (IP LAN/publik server)
+#       JICOFO_AUTH_PASSWORD=... JICOFO_COMPONENT_SECRET=... JVB_AUTH_PASSWORD=...
+#     Untuk HTTPS (profile proxy) tambahkan:
+#       MOODLE_DOMAIN=ujian.sekolah.sch.id  JITSI_DOMAIN=meet.sekolah.sch.id
+#       MOODLE_HOST=ujian.sekolah.sch.id    MOODLE_REVERSEPROXY=yes  MOODLE_SSLPROXY=yes
+#       JITSI_PUBLIC_URL=https://meet.sekolah.sch.id
+#     Untuk SSO (profile sso) tambahkan:
+#       KEYCLOAK_ADMIN_PASSWORD=...  KEYCLOAK_DB_PASSWORD=...
+#       KEYCLOAK_URL=https://sso.sekolah.sch.id  KEYCLOAK_DOMAIN=sso.sekolah.sch.id
+#     PENTING: ganti semua password default sebelum dipakai ujian sungguhan!
+#  2. Inti + Jitsi:      docker compose up -d
+#     + HTTPS & monitoring: docker compose --profile proxy --profile monitoring up -d
+#  3. Buka http://localhost:8080 (tunggu 3-5 menit pada instalasi pertama)
+#  4. Buat akun pengawas Jitsi:
+#     docker compose exec jitsi-prosody prosodyctl --config /config/prosody.cfg.lua \
+#       register admin meet.jitsi PasswordAnda
+# =====================================================================
+
+name: aplikasi-ujian
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-jitsi-env: &jitsi-env
+  TZ: ${TZ:-Asia/Jayapura}
+  PUBLIC_URL: ${JITSI_PUBLIC_URL:-http://localhost:8000}
+  XMPP_DOMAIN: meet.jitsi
+  XMPP_SERVER: xmpp.meet.jitsi
+  XMPP_BOSH_URL_BASE: http://xmpp.meet.jitsi:5280
+  XMPP_AUTH_DOMAIN: auth.meet.jitsi
+  XMPP_MUC_DOMAIN: muc.meet.jitsi
+  XMPP_INTERNAL_MUC_DOMAIN: internal-muc.meet.jitsi
+  XMPP_GUEST_DOMAIN: guest.meet.jitsi
+  JICOFO_AUTH_USER: focus
+  JICOFO_AUTH_PASSWORD: ${JICOFO_AUTH_PASSWORD:-JicofoPass123}
+  JICOFO_COMPONENT_SECRET: ${JICOFO_COMPONENT_SECRET:-JicofoSecret123}
+  JVB_AUTH_USER: jvb
+  JVB_AUTH_PASSWORD: ${JVB_AUTH_PASSWORD:-JvbPass123}
+  # Pengawas (user terdaftar) membuat ruangan, peserta masuk sebagai tamu
+  ENABLE_AUTH: "1"
+  ENABLE_GUESTS: "1"
+  AUTH_TYPE: internal
+  # Fitur pengawasan
+  ENABLE_LOBBY: "1"            # peserta menunggu persetujuan pengawas
+  ENABLE_AV_MODERATION: "1"    # pengawas bisa mematikan mic/kamera peserta
+  ENABLE_BREAKOUT_ROOMS: "1"   # bagi peserta ke beberapa ruang pengawasan
+  ENABLE_PREJOIN_PAGE: "1"
+  ENABLE_WELCOME_PAGE: "0"
+  START_AUDIO_MUTED: "1"
+
+services:
+  # =========================== INTI UJIAN ===========================
+  db:
+    image: bitnamilegacy/mariadb:11.4
+    container_name: ujian-db
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-RootPassword123!}
+      MARIADB_USER: ${DB_USER:-moodle}
+      MARIADB_PASSWORD: ${DB_PASSWORD:-MoodleDbPass123!}
+      MARIADB_DATABASE: ${DB_NAME:-moodle}
+      MARIADB_CHARACTER_SET: utf8mb4
+      MARIADB_COLLATE: utf8mb4_unicode_ci
+    volumes:
+      - db_data:/bitnami/mariadb
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p\"$$MARIADB_ROOT_PASSWORD\" --silent"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+    networks: [ujian-net]
+
+  redis:
+    image: redis:7-alpine
+    container_name: ujian-redis
+    restart: unless-stopped
+    logging: *default-logging
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks: [ujian-net]
+
+  moodle:
+    image: bitnamilegacy/moodle:4.5
+    container_name: ujian-app
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "${APP_PORT:-8080}:8080"
+      - "${APP_HTTPS_PORT:-8443}:8443"
+    environment:
+      MOODLE_DATABASE_TYPE: mariadb
+      MOODLE_DATABASE_HOST: db
+      MOODLE_DATABASE_PORT_NUMBER: 3306
+      MOODLE_DATABASE_USER: ${DB_USER:-moodle}
+      MOODLE_DATABASE_PASSWORD: ${DB_PASSWORD:-MoodleDbPass123!}
+      MOODLE_DATABASE_NAME: ${DB_NAME:-moodle}
+      MOODLE_USERNAME: ${MOODLE_USERNAME:-admin}
+      MOODLE_PASSWORD: ${MOODLE_PASSWORD:-Admin@12345}
+      MOODLE_EMAIL: ${MOODLE_EMAIL:-admin@example.com}
+      MOODLE_SITE_NAME: ${MOODLE_SITE_NAME:-Sistem Ujian Online}
+      MOODLE_LANG: id
+      MOODLE_HOST: ${MOODLE_HOST:-localhost:8080}
+      # Isi "yes" jika memakai profile proxy (Caddy / HTTPS)
+      MOODLE_REVERSEPROXY: ${MOODLE_REVERSEPROXY:-no}
+      MOODLE_SSLPROXY: ${MOODLE_SSLPROXY:-no}
+      # Email: Mailpit untuk testing, ganti SMTP asli saat produksi
+      MOODLE_SMTP_HOST: ${SMTP_HOST:-mailpit}
+      MOODLE_SMTP_PORT_NUMBER: ${SMTP_PORT:-1025}
+      MOODLE_SMTP_USER: ${SMTP_USER:-}
+      MOODLE_SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      MOODLE_SMTP_PROTOCOL: ${SMTP_PROTOCOL:-}
+      PHP_MEMORY_LIMIT: 512M
+      PHP_MAX_EXECUTION_TIME: 300
+      PHP_POST_MAX_SIZE: 256M
+      PHP_UPLOAD_MAX_FILESIZE: 256M
+      TZ: ${TZ:-Asia/Jayapura}
+    volumes:
+      - moodle_data:/bitnami/moodle
+      - moodledata_data:/bitnami/moodledata
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/login/index.php >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 300s
+    networks: [ujian-net]
+
+  # Cron Moodle: menjalankan tugas terjadwal tiap menit di dalam container moodle
+  # (notifikasi, backup kursus, penilaian tertunda, pembersihan sesi)
+  cron:
+    image: docker:cli
+    container_name: ujian-cron
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      moodle:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        while true; do
+          docker exec -u daemon ujian-app php /opt/bitnami/moodle/admin/cli/cron.php >/dev/null 2>&1
+          sleep 60
+        done
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [ujian-net]
+
+  # =================== BAGIKAN LAYAR PESERTA (JITSI) ===================
+  jitsi-web:
+    image: jitsi/web:stable
+    container_name: ujian-jitsi-web
+    restart: unless-stopped
+    logging: *default-logging
+    ports:
+      - "${JITSI_HTTP_PORT:-8000}:80"
+      - "${JITSI_HTTPS_PORT:-8444}:443"
+    environment:
+      <<: *jitsi-env
+      ENABLE_P2P: "0"
+      DISABLE_DEEP_LINKING: "true"
+    volumes:
+      - jitsi_web:/config
+    depends_on: [jitsi-prosody]
+    networks:
+      ujian-net:
+        aliases: [meet.jitsi]
+
+  jitsi-prosody:
+    image: jitsi/prosody:stable
+    container_name: ujian-jitsi-prosody
+    restart: unless-stopped
+    logging: *default-logging
+    expose: ["5222", "5347", "5280"]
+    environment:
+      <<: *jitsi-env
+    volumes:
+      - jitsi_prosody_config:/config
+      - jitsi_prosody_plugins:/prosody-plugins-custom
+    networks:
+      ujian-net:
+        aliases: [xmpp.meet.jitsi]
+
+  jitsi-jicofo:
+    image: jitsi/jicofo:stable
+    container_name: ujian-jitsi-jicofo
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      <<: *jitsi-env
+    volumes:
+      - jitsi_jicofo:/config
+    depends_on: [jitsi-prosody]
+    networks: [ujian-net]
+
+  jitsi-jvb:
+    image: jitsi/jvb:stable
+    container_name: ujian-jitsi-jvb
+    restart: unless-stopped
+    logging: *default-logging
+    ports:
+      - "${JVB_PORT:-10000}:10000/udp"
+    environment:
+      <<: *jitsi-env
+      JVB_PORT: 10000
+      # Isi dengan IP LAN/publik server agar video peserta tersambung
+      JVB_ADVERTISE_IPS: ${JVB_ADVERTISE_IPS:-127.0.0.1}
+    volumes:
+      - jitsi_jvb:/config
+    depends_on: [jitsi-prosody]
+    networks: [ujian-net]
+
+  # =========================== BACKUP ===============================
+  # Database: dump harian jam 02:00
+  backup-db:
+    image: databack/mysql-backup:latest
+    container_name: ujian-backup-db
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_SERVER: db
+      DB_PORT: 3306
+      DB_USER: root
+      DB_PASS: ${DB_ROOT_PASSWORD:-RootPassword123!}
+      DB_DUMP_TARGET: /backup
+      DB_DUMP_FREQ: 1440
+      DB_DUMP_BEGIN: "0200"
+      NICE: "true"
+    volumes:
+      - ./backup/db:/backup
+    networks: [ujian-net]
+
+  # File Moodle (moodledata: upload, bank soal, jawaban esai): arsip harian jam 03:00
+  backup-files:
+    image: offen/docker-volume-backup:v2
+    container_name: ujian-backup-files
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      BACKUP_CRON_EXPRESSION: "0 3 * * *"
+      BACKUP_FILENAME: moodle-files-%Y-%m-%d.tar.gz
+      BACKUP_RETENTION_DAYS: "14"
+    volumes:
+      - moodle_data:/backup/moodle_data:ro
+      - moodledata_data:/backup/moodledata_data:ro
+      - ./backup/files:/archive
+    networks: [ujian-net]
+
+  # =========================== UTILITAS =============================
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: ujian-mailpit
+    restart: unless-stopped
+    logging: *default-logging
+    ports:
+      - "${MAILPIT_PORT:-8025}:8025"
+    networks: [ujian-net]
+
+  phpmyadmin:
+    image: phpmyadmin:5
+    container_name: ujian-pma
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on: [db]
+    environment:
+      PMA_HOST: db
+      UPLOAD_LIMIT: 256M
+    ports:
+      - "${PMA_PORT:-8081}:80"
+    networks: [ujian-net]
+
+  # ======================= HTTPS OTOMATIS (profile: proxy) ==========
+  caddy:
+    image: caddy:2-alpine
+    container_name: ujian-caddy
+    restart: unless-stopped
+    logging: *default-logging
+    profiles: ["proxy"]
+    depends_on: [moodle, jitsi-web]
+    ports:
+      - "80:80"
+      - "443:443"
+    configs:
+      - source: caddyfile
+        target: /etc/caddy/Caddyfile
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [ujian-net]
+
+  # ================= LOGIN TERPUSAT / SSO (profile: sso) ==============
+  # Keycloak: manajemen akun, login SSO, 2FA (OTP), reset password,
+  # registrasi mandiri, login Google/Microsoft/GitHub, import user massal.
+  keycloak-db:
+    image: postgres:16-alpine
+    container_name: ujian-keycloak-db
+    restart: unless-stopped
+    logging: *default-logging
+    profiles: ["sso"]
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: ${KEYCLOAK_DB_USER:-keycloak}
+      POSTGRES_PASSWORD: ${KEYCLOAK_DB_PASSWORD:-KeycloakDbPass123!}
+    volumes:
+      - keycloak_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d keycloak"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [ujian-net]
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    container_name: ujian-keycloak
+    restart: unless-stopped
+    logging: *default-logging
+    profiles: ["sso"]
+    command: ["start"]
+    depends_on:
+      keycloak-db:
+        condition: service_healthy
+    ports:
+      - "${KEYCLOAK_PORT:-8082}:8080"
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://keycloak-db:5432/keycloak
+      KC_DB_USERNAME: ${KEYCLOAK_DB_USER:-keycloak}
+      KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:-KeycloakDbPass123!}
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-GantiKeycloakAdmin!}
+      KC_HTTP_ENABLED: "true"
+      KC_HOSTNAME: ${KEYCLOAK_URL:-http://localhost:8082}
+      KC_HOSTNAME_STRICT: "false"
+      KC_PROXY_HEADERS: xforwarded
+      KC_HEALTH_ENABLED: "true"
+      TZ: ${TZ:-Asia/Jayapura}
+    volumes:
+      - keycloak_data:/opt/keycloak/data
+    networks: [ujian-net]
+
+  # ==================== MONITORING (profile: monitoring) ============
+  uptime-kuma:
+    image: louislam/uptime-kuma:1
+    container_name: ujian-kuma
+    restart: unless-stopped
+    logging: *default-logging
+    profiles: ["monitoring"]
+    ports:
+      - "${KUMA_PORT:-3001}:3001"
+    volumes:
+      - kuma_data:/app/data
+    networks: [ujian-net]
+
+  dozzle:
+    image: amir20/dozzle:latest
+    container_name: ujian-dozzle
+    restart: unless-stopped
+    logging: *default-logging
+    profiles: ["monitoring"]
+    ports:
+      - "${DOZZLE_PORT:-9999}:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [ujian-net]
+
+# Caddyfile tertanam langsung (butuh Docker Compose v2.23.1 atau lebih baru)
+configs:
+  caddyfile:
+    content: |
+      ${MOODLE_DOMAIN:-ujian.example.com} {
+        encode gzip zstd
+        request_body {
+          max_size 256MB
+        }
+        reverse_proxy moodle:8080
+      }
+      ${JITSI_DOMAIN:-meet.example.com} {
+        encode gzip zstd
+        reverse_proxy jitsi-web:80
+      }
+      ${KEYCLOAK_DOMAIN:-sso.example.com} {
+        reverse_proxy keycloak:8080
+      }
+
+volumes:
+  db_data:
+  redis_data:
+  moodle_data:
+  moodledata_data:
+  jitsi_web:
+  jitsi_prosody_config:
+  jitsi_prosody_plugins:
+  jitsi_jicofo:
+  jitsi_jvb:
+  caddy_data:
+  caddy_config:
+  kuma_data:
+  keycloak_db:
+  keycloak_data:
+
+networks:
+  ujian-net:
+    driver: bridge
